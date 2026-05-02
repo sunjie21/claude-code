@@ -230,7 +230,11 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { recordLLMObservation } from '../langfuse/index.js'
 import type { LangfuseSpan } from '../langfuse/index.js'
-import { convertMessagesToLangfuse, convertOutputToLangfuse, convertToolsToLangfuse } from '../langfuse/convert.js'
+import {
+  convertMessagesToLangfuse,
+  convertOutputToLangfuse,
+  convertToolsToLangfuse,
+} from '../langfuse/convert.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
 import {
@@ -442,7 +446,7 @@ function configureEffortParams(
     betas.push(EFFORT_BETA_HEADER)
   } else if (typeof effortValue === 'string') {
     // Send string effort level as is
-    outputConfig.effort = effortValue as "high" | "medium" | "low" | "max"
+    outputConfig.effort = effortValue as 'high' | 'medium' | 'low' | 'max'
     betas.push(EFFORT_BETA_HEADER)
   } else if (process.env.USER_TYPE === 'ant') {
     // Numeric effort override - ant-only (uses anthropic_internal)
@@ -615,7 +619,8 @@ export function userMessageToMessageParam(
     role: 'user',
     content: (Array.isArray(message.message!.content)
       ? [...message.message!.content]
-      : message.message!.content) as import('@anthropic-ai/sdk/resources/beta/messages/messages.js').BetaContentBlockParam[],
+      : message.message!
+          .content) as import('@anthropic-ai/sdk/resources/beta/messages/messages.js').BetaContentBlockParam[],
   }
 }
 
@@ -666,7 +671,9 @@ export function assistantMessageToMessageParam(
     content:
       typeof message.message!.content === 'string'
         ? message.message!.content
-        : message.message!.content!.map(stripGeminiProviderMetadata) as BetaContentBlockParam[],
+        : (message.message!.content!.map(
+            stripGeminiProviderMetadata,
+          ) as BetaContentBlockParam[]),
   }
 }
 
@@ -681,10 +688,8 @@ function stripGeminiProviderMetadata<T extends BetaContentBlockParam | string>(
   }
 
   const obj = contentBlock as unknown as Record<string, unknown>
-  const {
-    _geminiThoughtSignature: _unusedGeminiThoughtSignature,
-    ...rest
-  } = obj
+  const { _geminiThoughtSignature: _unusedGeminiThoughtSignature, ...rest } =
+    obj
   return rest as unknown as T
 }
 
@@ -1343,7 +1348,13 @@ async function* queryModel(
     // OpenAI emulates Anthropic's dynamic tool loading client-side. It needs
     // the full tool pool so ToolSearchTool can search deferred MCP tools that
     // were intentionally filtered out of the initial API tool list above.
-    yield* queryModelOpenAI(messagesForAPI, systemPrompt, tools, signal, options)
+    yield* queryModelOpenAI(
+      messagesForAPI,
+      systemPrompt,
+      tools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1362,7 +1373,13 @@ async function* queryModel(
 
   if (getAPIProvider() === 'grok') {
     const { queryModelGrok } = await import('./grok/index.js')
-    yield* queryModelGrok(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    yield* queryModelGrok(
+      messagesForAPI,
+      systemPrompt,
+      filteredTools,
+      signal,
+      options,
+    )
     return
   }
 
@@ -1776,6 +1793,10 @@ async function* queryModel(
   // captures only primitives instead of paramsFromContext's full closure scope
   // (messagesForAPI, system, allTools, betas — the entire request-building
   // context), which would otherwise be pinned until the promise resolves.
+  // Also capture thinking params for Langfuse observability.
+  // Pass the entire thinking config object so all fields (type, budget_tokens,
+  // and any future additions) flow through without cherry-picking.
+  let langfuseThinking: BetaMessageStreamParams['thinking'] | undefined
   {
     const queryParams = paramsFromContext({
       model: options.model,
@@ -1783,8 +1804,10 @@ async function* queryModel(
     })
     const logMessagesLength = queryParams.messages.length
     const logBetas = useBetas ? (queryParams.betas ?? []) : []
-    const logThinkingType = queryParams.thinking?.type ?? 'disabled'
     const logEffortValue = queryParams.output_config?.effort
+    if (queryParams.thinking && queryParams.thinking.type !== 'disabled') {
+      langfuseThinking = queryParams.thinking
+    }
     void options.getToolPermissionContext().then(permissionContext => {
       logAPIQuery({
         model: options.model,
@@ -1794,7 +1817,7 @@ async function* queryModel(
         permissionMode: permissionContext.mode,
         querySource: options.querySource,
         queryTracking: options.queryTracking,
-        thinkingType: logThinkingType,
+        thinkingConfig,
         effortValue: logEffortValue,
         fastMode: isFastMode,
         previousRequestId,
@@ -1806,6 +1829,9 @@ async function* queryModel(
   let ttftMs = 0
   let partialMessage: BetaMessage | undefined
   const contentBlocks: (BetaContentBlock | ConnectorTextBlock)[] = []
+  // Accumulate streaming deltas in arrays to avoid O(n²) string concatenation.
+  // Joined and assigned to contentBlock fields at content_block_stop.
+  const streamingDeltas = new Map<number, string[]>()
   let usage: NonNullableUsage = EMPTY_USAGE
   let costUSD = 0
   let stopReason: BetaStopReason | null = null
@@ -2092,6 +2118,8 @@ async function* queryModel(
                 }
                 break
             }
+            // Initialize delta accumulator for this content block
+            streamingDeltas.set(part.index, [])
             break
           case 'content_block_delta': {
             const contentBlock = contentBlocks[part.index]
@@ -2121,7 +2149,9 @@ async function* queryModel(
                 })
                 throw new Error('Content block is not a connector_text block')
               }
-              ;(contentBlock as { connector_text: string }).connector_text += delta.connector_text
+              streamingDeltas
+                .get(part.index)
+                ?.push(delta.connector_text as string)
             } else {
               switch (delta.type) {
                 case 'citations_delta':
@@ -2151,7 +2181,9 @@ async function* queryModel(
                     })
                     throw new Error('Content block input is not a string')
                   }
-                  contentBlock.input += delta.partial_json
+                  streamingDeltas
+                    .get(part.index)
+                    ?.push(delta.partial_json as string)
                   break
                 case 'text_delta':
                   if (contentBlock.type !== 'text') {
@@ -2165,7 +2197,7 @@ async function* queryModel(
                     })
                     throw new Error('Content block is not a text block')
                   }
-                  ;(contentBlock as { text: string }).text += delta.text
+                  streamingDeltas.get(part.index)?.push(delta.text!)
                   break
                 case 'signature_delta':
                   if (
@@ -2200,7 +2232,7 @@ async function* queryModel(
                     })
                     throw new Error('Content block is not a thinking block')
                   }
-                  ;(contentBlock as { thinking: string }).thinking += delta.thinking
+                  streamingDeltas.get(part.index)?.push(delta.thinking!)
                   break
               }
             }
@@ -2231,6 +2263,32 @@ async function* queryModel(
                   part.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
               })
               throw new Error('Message not found')
+            }
+            // Join accumulated streaming deltas into the contentBlock fields
+            // to avoid O(n²) string concatenation during streaming.
+            const deltas = streamingDeltas.get(part.index)
+            if (deltas && deltas.length > 0) {
+              const joined = deltas.join('')
+              switch (contentBlock.type) {
+                case 'text':
+                  ;(contentBlock as { text: string }).text = joined
+                  break
+                case 'thinking':
+                  ;(contentBlock as { thinking: string }).thinking = joined
+                  break
+                case 'tool_use':
+                case 'server_tool_use':
+                  contentBlock.input = joined
+                  break
+                default:
+                  if ((contentBlock.type as string) === 'connector_text') {
+                    ;(
+                      contentBlock as { connector_text: string }
+                    ).connector_text = joined
+                  }
+                  break
+              }
+              streamingDeltas.delete(part.index)
             }
             const m: AssistantMessage = {
               message: {
@@ -2292,7 +2350,10 @@ async function* queryModel(
             }
 
             // Update cost
-            const costUSDForPart = calculateUSDCost(resolvedModel, usage as unknown as BetaUsage)
+            const costUSDForPart = calculateUSDCost(
+              resolvedModel,
+              usage as unknown as BetaUsage,
+            )
             costUSD += addToTotalSessionCost(
               costUSDForPart,
               usage as unknown as BetaUsage,
@@ -2545,6 +2606,9 @@ async function* queryModel(
           maxOutputTokens,
           thinkingType:
             thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+          ...(thinkingConfig.type === 'enabled' && {
+            thinkingBudgetTokens: thinkingConfig.budgetTokens,
+          }),
           fallback_disabled: true,
           request_id: (streamRequestId ??
             'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -2577,6 +2641,9 @@ async function* queryModel(
         maxOutputTokens,
         thinkingType:
           thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        ...(thinkingConfig.type === 'enabled' && {
+          thinkingBudgetTokens: thinkingConfig.budgetTokens,
+        }),
         fallback_disabled: false,
         request_id: (streamRequestId ??
           'unknown') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -2693,6 +2760,9 @@ async function* queryModel(
         maxOutputTokens,
         thinkingType:
           thinkingConfig.type as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        ...(thinkingConfig.type === 'enabled' && {
+          thinkingBudgetTokens: thinkingConfig.budgetTokens,
+        }),
         request_id:
           failedRequestId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         fallback_cause:
@@ -2872,10 +2942,14 @@ async function* queryModel(
     // message_delta handler before any yield. Fallback pushes to newMessages
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
-      const fallbackUsage = fallbackMessage.message.usage as BetaMessageDeltaUsage
+      const fallbackUsage = fallbackMessage.message
+        .usage as BetaMessageDeltaUsage
       usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason as BetaStopReason
-      const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage as unknown as BetaUsage)
+      const fallbackCost = calculateUSDCost(
+        resolvedModel,
+        fallbackUsage as unknown as BetaUsage,
+      )
       costUSD += addToTotalSessionCost(
         fallbackCost,
         fallbackUsage as unknown as BetaUsage,
@@ -2925,12 +2999,15 @@ async function* queryModel(
     endTime: new Date(),
     completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
     tools: convertToolsToLangfuse(toolSchemas as unknown[]),
+    thinking: langfuseThinking,
   })
 
   void options.getToolPermissionContext().then(permissionContext => {
     logAPISuccessAndDuration({
       model:
-        (newMessages[0]?.message.model as string | undefined) ?? partialMessage?.model ?? options.model,
+        (newMessages[0]?.message.model as string | undefined) ??
+        partialMessage?.model ??
+        options.model,
       preNormalizedModel: options.model,
       usage,
       start,

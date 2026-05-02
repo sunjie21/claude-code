@@ -267,7 +267,9 @@ export function truncateHeadForPTLRetry(
     let acc = 0
     dropCount = 0
     for (const g of groups) {
-      acc += roughTokenCountEstimationForMessages(g as Parameters<typeof roughTokenCountEstimationForMessages>[0])
+      acc += roughTokenCountEstimationForMessages(
+        g as Parameters<typeof roughTokenCountEstimationForMessages>[0],
+      )
       dropCount++
       if (acc >= tokenGap) break
     }
@@ -332,13 +334,12 @@ export type RecompactionInfo = {
  * Order: boundaryMarker, summaryMessages, messagesToKeep, attachments, hookResults
  */
 export function buildPostCompactMessages(result: CompactionResult): Message[] {
-  return [
-    result.boundaryMarker,
-    ...result.summaryMessages,
-    ...(result.messagesToKeep ?? []),
-    ...result.attachments,
-    ...result.hookResults,
-  ]
+  return ([result.boundaryMarker] as Message[]).concat(
+    result.summaryMessages,
+    result.messagesToKeep ?? [],
+    result.attachments,
+    result.hookResults,
+  )
 }
 
 /**
@@ -519,7 +520,7 @@ export async function compactConversation(
     }
 
     // Store the current file state before clearing
-    const preCompactReadFileState = cacheToObject(context.readFileState)
+    let preCompactReadFileState = cacheToObject(context.readFileState)
 
     // Clear the cache
     context.readFileState.clear()
@@ -541,6 +542,9 @@ export async function compactConversation(
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
+    // Release the readFileState snapshot — it can hold 25+ MB of file content
+    preCompactReadFileState =
+      undefined as unknown as typeof preCompactReadFileState
 
     const postCompactFileAttachments: AttachmentMessage[] = [
       ...fileAttachments,
@@ -647,6 +651,8 @@ export async function compactConversation(
 
     // Extract compaction API usage metrics
     const compactionUsage = getTokenUsage(summaryResponse)
+    // Release the full API response — it holds content blocks + usage metadata
+    summaryResponse = undefined as unknown as typeof summaryResponse
 
     const querySourceForEvent =
       recompactionInfo?.querySource ?? context.options.querySource ?? 'unknown'
@@ -762,7 +768,7 @@ export async function compactConversation(
     context.setStreamMode?.('requesting')
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_end' })
-    context.setSDKStatus?.("" as SDKStatus)
+    context.setSDKStatus?.('' as SDKStatus)
   }
 }
 
@@ -920,7 +926,7 @@ export async function partialCompactConversation(
     }
 
     // Store the current file state before clearing
-    const preCompactReadFileState = cacheToObject(context.readFileState)
+    let preCompactReadFileState = cacheToObject(context.readFileState)
     context.readFileState.clear()
     context.loadedNestedMemoryPaths?.clear()
     // Intentionally NOT resetting sentSkillNames — see compactConversation()
@@ -935,6 +941,9 @@ export async function partialCompactConversation(
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
+    // Release the readFileState snapshot — it can hold 25+ MB of file content
+    preCompactReadFileState =
+      undefined as unknown as typeof preCompactReadFileState
 
     const postCompactFileAttachments: AttachmentMessage[] = [
       ...fileAttachments,
@@ -990,6 +999,8 @@ export async function partialCompactConversation(
       summaryResponse,
     ])
     const compactionUsage = getTokenUsage(summaryResponse)
+    // Release the full API response — it holds content blocks + usage metadata
+    summaryResponse = undefined as unknown as typeof summaryResponse
 
     logEvent('tengu_partial_compact', {
       preCompactTokenCount,
@@ -1105,7 +1116,7 @@ export async function partialCompactConversation(
     context.setStreamMode?.('requesting')
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_end' })
-    context.setSDKStatus?.("" as SDKStatus)
+    context.setSDKStatus?.('' as SDKStatus)
   }
 }
 
@@ -1333,8 +1344,18 @@ async function streamCompactSummary({
       let next = await streamIter.next()
 
       while (!next.done) {
-        const event = next.value as StreamEvent | AssistantMessage | SystemAPIErrorMessage
-        const streamEvent = event as { type: string; event: { type: string; content_block: { type: string }; delta: { type: string; text: string } } }
+        const event = next.value as
+          | StreamEvent
+          | AssistantMessage
+          | SystemAPIErrorMessage
+        const streamEvent = event as {
+          type: string
+          event: {
+            type: string
+            content_block: { type: string }
+            delta: { type: string; text: string }
+          }
+        }
 
         if (
           !hasStartedStreaming &&
